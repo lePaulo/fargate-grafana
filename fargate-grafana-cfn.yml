@@ -1,0 +1,300 @@
+Parameters:
+
+  VpcId:
+    Description: The VPC to which this cluster should be deployed
+    Type: 'AWS::EC2::VPC::Id'
+
+  PrivateSubnets:
+    Description: Choose two subnets in this VPC for the Fargate service to run
+    Type: 'List<AWS::EC2::Subnet::Id>'
+
+  PublicSubnets:
+    Description: Choose two subnets in this VPC for the LoadBalancer service
+    Type: 'List<AWS::EC2::Subnet::Id>'
+
+  AdminLogin:
+    Description: Choose a login name for admin user
+    Type: 'String'
+    Default: 'admin'
+  
+  AdminPassword:
+    Description: Choose a password for admin user
+    Type: 'String'
+    NoEcho: true
+
+Resources:
+  
+  FargateAlb:
+    Type: 'AWS::ElasticLoadBalancingV2::LoadBalancer'
+    Properties:
+      Name: FargateAlb
+      Subnets: !Ref PublicSubnets
+      Type: application
+      SecurityGroups:
+        - !Ref FargateAlbSG
+
+  FargateTargetGroup:
+    Type: 'AWS::ElasticLoadBalancingV2::TargetGroup'
+    Properties:
+      Name: FargateTargetGroup
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 3000
+      HealthCheckPath: /
+      TargetType: ip
+
+  Listener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref FargateTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref FargateAlb
+      Port: 80
+      Protocol: HTTP
+
+  FargateAlbSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: SG for the Fargate ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - CidrIpv6: ::/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+          Description: 'Inbound rule for IPv6 traffic'
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          ToPort: 80
+          IpProtocol: TCP
+          Description: 'Inbound rule for IPv4 traffic'
+
+  LogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: /ecs/grafana-fargate
+
+  GrafanaEFSVolume:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: grafana-fargate-cluster
+
+  EcsTaskExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+  
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchReadOnlyAccess
+
+  GrafanaEFSServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow access from Fargate to EFS server endpoints for grafana mount
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref GrafanaSecurityGroup
+
+  GrafanaEFSMountTarget0:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref GrafanaEFSVolume
+      SecurityGroups:
+        - !Ref GrafanaEFSServerSecurityGroup
+      SubnetId: !Select [ 0, !Ref PrivateSubnets ]
+  
+  GrafanaEFSMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref GrafanaEFSVolume
+      SecurityGroups:
+        - !Ref GrafanaEFSServerSecurityGroup
+      SubnetId: !Select [ 1, !Ref PrivateSubnets ]
+
+  GrafanaEFSAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref GrafanaEFSVolume
+      PosixUser:
+        Uid: "472"
+        Gid: "0"
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: "472"
+          OwnerUid: "0"
+          Permissions: "0777"
+        Path: "/grafana"
+
+  TaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Properties:
+      Family: grafana-fargate-demo
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      Memory: 512
+      Cpu: 256
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      Volumes:
+        - Name: 'grafana_data'
+          EfsVolumeConfiguration:
+            FileSystemId: !Ref GrafanaEFSVolume
+            TransitEncryption: ENABLED
+            AuthorizationConfig: 
+              AccessPointId: !Ref GrafanaEFSAccessPoint
+      ContainerDefinitions:
+        - Name: grafana-container
+          Image: grafana/grafana
+          Memory: 512
+          Cpu: 256
+          Environment:
+            - Name: 'GF_AUTH_ANONYMOUS_ENABLED'
+              Value: 'true'
+            - Name: 'GF_SECURITY_ALLOW_EMBEDDING'
+              Value: 'true'
+            - Name: 'GF_ORG_NAME'
+              Value: 'Main Org.'
+            - Name: 'GF_ORG_ROLE'
+              Value: 'Viewer'
+            - Name: 'GF_UID'
+              Value: '472'
+            - Name: 'GF_SECURITY_ADMIN_USER'
+              Value: !Ref AdminLogin
+            - Name: 'GF_SECURITY_ADMIN_PASSWORD'
+              Value: !Ref AdminPassword
+          PortMappings:
+            - ContainerPort: 3000
+          MountPoints:
+            - SourceVolume: 'grafana_data'
+              ContainerPath: '/var/lib/grafana'
+              ReadOnly: false
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/grafana-fargate
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: dashboard
+              
+  GrafanaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId: !Ref 'VpcId'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref FargateAlbSG
+
+  ServiceDefinition:
+    Type: 'AWS::ECS::Service'
+    DependsOn: 
+      - GrafanaEFSMountTarget0
+      - GrafanaEFSMountTarget1
+      - Listener
+    Properties:
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      Cluster: !Ref ECSCluster
+      ServiceName: grafana-dashboard-service
+      DesiredCount: 1
+      LoadBalancers:
+        - TargetGroupArn:
+            Ref: FargateTargetGroup
+          ContainerPort: 3000
+          ContainerName: grafana-container
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref PrivateSubnets
+          SecurityGroups: 
+            - !Ref 'GrafanaSecurityGroup'
+
+  Cloudfrontdistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        IPV6Enabled: true
+        Enabled: true
+        Origins:
+          - Id: !GetAtt FargateAlb.DNSName
+            DomainName: !GetAtt FargateAlb.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+            ConnectionAttempts: 3
+            ConnectionTimeout: 10
+            OriginShield:
+              Enabled: false
+        DefaultCacheBehavior:
+          TargetOriginId: !GetAtt FargateAlb.DNSName
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: ["HEAD", "DELETE", "POST", "GET", "OPTIONS", "PUT", "PATCH"]
+          Compress: true
+          CachePolicyId: !Ref CloudfrontdistributionCachePolicy
+          OriginRequestPolicyId: !Ref CloudfrontdistributionOriginRequestPolicy
+
+  CloudfrontdistributionCachePolicy:
+    Type: 'AWS::CloudFront::CachePolicy'
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub ${AWS::StackName}-CachingDisabled
+        DefaultTTL: 0
+        MaxTTL: 0
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: false
+          EnableAcceptEncodingBrotli: false
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  CloudfrontdistributionOriginRequestPolicy:
+    Type: 'AWS::CloudFront::OriginRequestPolicy'
+    Properties:
+      OriginRequestPolicyConfig:
+        Comment: Policy with forward all parameters in viewer requests
+        Name: !Sub ${AWS::StackName}-AllViewer
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        CookiesConfig:
+          CookieBehavior: all
+        QueryStringsConfig:
+          QueryStringBehavior: all
+
+Outputs:
+  GrafanaUrl:
+    Value: !GetAtt Cloudfrontdistribution.DomainName
